@@ -1,6 +1,7 @@
 package common
 
 import (
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"github.com/nilshell/xmlrpc"
@@ -28,6 +29,7 @@ type XenAPIObject struct {
 	Client *XenAPIClient
 }
 
+type Host XenAPIObject
 type VM XenAPIObject
 type SR XenAPIObject
 type VDI XenAPIObject
@@ -115,12 +117,17 @@ func (client *XenAPIClient) APICall(result *APIResult, method string, params ...
 	return
 }
 
-func (client *XenAPIClient) GetHosts() (err error) {
+func (client *XenAPIClient) GetHosts() (hosts []*Host, err error) {
+	hosts = make([]*Host, 0)
 	result := APIResult{}
 	_ = client.APICall(&result, "host.get_all")
-	hosts := result.Value
-	fmt.Println(hosts)
-	return nil
+	for _, elem := range result.Value.([]interface{}) {
+		host := new(Host)
+		host.Ref = elem.(string)
+		host.Client = client
+		hosts = append(hosts, host)
+	}
+	return
 }
 
 func (client *XenAPIClient) GetPools() (pools []*Pool, err error) {
@@ -313,6 +320,41 @@ func (client *XenAPIClient) CreateTask() (task *Task, err error) {
 	task = new(Task)
 	task.Ref = result.Value.(string)
 	task.Client = client
+	return
+}
+
+// Host associated functions
+
+func (self *Host) GetSoftwareVersion() (versions map[string]interface{}, err error) {
+	versions = make(map[string]interface{})
+
+	result := APIResult{}
+	err = self.Client.APICall(&result, "host.get_software_version", self.Ref)
+	if err != nil {
+		return nil, err
+	}
+
+	for k, v := range result.Value.(xmlrpc.Struct) {
+		versions[k] = v.(string)
+	}
+	return
+}
+
+func (self *Host) CallPlugin(plugin, function string, args map[string]string) (res string, err error) {
+
+	args_rec := make(xmlrpc.Struct)
+	for key, value := range args {
+		args_rec[key] = value
+	}
+
+	result := APIResult{}
+	err = self.Client.APICall(&result, "host.call_plugin", self.Ref, plugin, function, args_rec)
+	if err != nil {
+		return "", err
+	}
+
+	// The plugin should return a string value
+	res = result.Value.(string)
 	return
 }
 
@@ -850,6 +892,106 @@ func (self *VDI) Destroy() (err error) {
 		return err
 	}
 	return
+}
+
+// Expose a VDI using the Transfer VM
+// (Legacy VHD export)
+
+type TransferRecord struct {
+	UrlFull string `xml:"url_full,attr"`
+}
+
+func (self *VDI) Expose(format string) (url string, err error) {
+
+	hosts, err := self.Client.GetHosts()
+
+	if err != nil {
+		err = errors.New(fmt.Sprintf("Could not retrieve hosts in the pool: %s", err.Error()))
+		return "", err
+	}
+	host := hosts[0]
+
+	disk_uuid, err := self.GetUuid()
+
+	if err != nil {
+		err = errors.New(fmt.Sprintf("Failed to get VDI uuid for %s: %s", self.Ref, err.Error()))
+		return "", err
+	}
+
+	args := make(map[string]string)
+	args["transfer_mode"] = "http"
+	args["vdi_uuid"] = disk_uuid
+	args["expose_vhd"] = "true"
+	args["network_uuid"] = "management"
+	args["timeout_minutes"] = "5"
+
+	handle, err := host.CallPlugin("transfer", "expose", args)
+
+	if err != nil {
+		err = errors.New(fmt.Sprintf("Error whilst exposing VDI %s: %s", disk_uuid, err.Error()))
+		return "", err
+	}
+
+	args = make(map[string]string)
+	args["record_handle"] = handle
+	record_xml, err := host.CallPlugin("transfer", "get_record", args)
+
+	if err != nil {
+		err = errors.New(fmt.Sprintf("Unable to retrieve transfer record for VDI %s: %s", disk_uuid, err.Error()))
+		return "", err
+	}
+
+	var record TransferRecord
+	xml.Unmarshal([]byte(record_xml), &record)
+
+	if record.UrlFull == "" {
+		return "", errors.New(fmt.Sprintf("Error: did not parse XML properly: '%s'", record_xml))
+	}
+
+	// Handles either raw or VHD formats
+
+	switch format {
+	case "vhd":
+		url = fmt.Sprintf("%s.vhd", record.UrlFull)
+
+	case "raw":
+		url = record.UrlFull
+	}
+
+	return
+}
+
+// Unexpose a VDI if exposed with a Transfer VM.
+
+func (self *VDI) Unexpose() (err error) {
+
+	disk_uuid, err := self.GetUuid()
+
+	if err != nil {
+		return err
+	}
+
+	hosts, err := self.Client.GetHosts()
+
+	if err != nil {
+		err = errors.New(fmt.Sprintf("Could not retrieve hosts in the pool: %s", err.Error()))
+		return err
+	}
+
+	host := hosts[0]
+
+	args := make(map[string]string)
+	args["vdi_uuid"] = disk_uuid
+
+	result, err := host.CallPlugin("transfer", "unexpose", args)
+
+	if err != nil {
+		return err
+	}
+
+	log.Println(fmt.Sprintf("Unexpose result: %s", result))
+
+	return nil
 }
 
 // Task associated functions
